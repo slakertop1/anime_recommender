@@ -1,25 +1,42 @@
-"""Гибридная логика рекомендаций.
+"""Жанровая логика рекомендаций с учётом новизны.
 
-Объединяет два сигнала:
+Кандидаты ищутся по любимым жанрам пользователя (Jikan-поиск) и ранжируются по
+двум множителям:
 
-1. **Рекомендации MAL** — для любимых тайтлов пользователя берём то, что
-   MAL советует по принципу «кто смотрел это, советует то», и аккумулируем
-   голоса, взвешивая их оценкой пользователя.
-2. **Совпадение жанров** — строим профиль вкусов пользователя по жанрам
-   (взвешенный оценками) и считаем близость каждого кандидата к этому профилю.
+1. **Совпадение жанров** — близость набора жанров кандидата к профилю вкусов
+   пользователя (профиль взвешен оценками просмотренного).
+2. **Новизна** — год выхода: свежие тайтлы получают приоритет, но классика не
+   вытесняется полностью.
 
-Итоговый ранг = ``alpha * сигнал_MAL + (1 - alpha) * сигнал_жанров``.
+Итог: ``score = совпадение_жанров * вес_новизны``.
+
+Функция :func:`recommend_iter` — генератор: отдаёт промежуточные результаты по
+мере опроса жанров, чтобы интерфейс показывал тайтлы прямо во время анализа.
 """
 
 from __future__ import annotations
 
-import math
+import datetime
 from collections import defaultdict
 from dataclasses import dataclass
 
-import requests
-
 import mal_client as mc
+
+# Год для расчёта новизны. Это обычный код приложения (не workflow), поэтому
+# datetime доступен.
+CURRENT_YEAR = datetime.date.today().year
+
+# Множитель новизны: самый старый тайтл получает RECENCY_FLOOR, самый свежий — 1.
+RECENCY_FLOOR = 0.5
+# С какого года считаем «совсем старым» (нормировка новизны).
+RECENCY_BASE_YEAR = 2005
+# Сколько последних лет считаем «свежими» для отдельного запроса.
+FRESH_YEARS = 3
+
+# Множитель качества по оценке MAL: ниже QUALITY_LOW → минимум, выше QUALITY_HIGH → 1.
+QUALITY_FLOOR = 0.5
+QUALITY_LOW = 6.0
+QUALITY_HIGH = 8.5
 
 
 @dataclass
@@ -28,12 +45,13 @@ class Recommendation:
     title: str
     image_url: str | None
     url: str | None
-    score: float          # итоговый гибридный балл 0..1
-    rec_score: float      # вклад рекомендаций MAL 0..1
-    genre_score: float    # вклад совпадения жанров 0..1
+    score: float          # итоговый балл 0..1
+    genre_score: float    # совпадение жанров 0..1
+    recency: float        # вес новизны 0..1
     genres: list[str]
     matched_genres: list[str]
-    sources: list[str]    # названия просмотренных тайтлов, давших этого кандидата
+    year: int | None
+    mal_score: float = 0.0  # оценка тайтла на MAL (для пояснения)
 
 
 def build_genre_profile(watched: list[mc.WatchedAnime]) -> dict[str, float]:
@@ -58,7 +76,7 @@ def build_genre_profile(watched: list[mc.WatchedAnime]) -> dict[str, float]:
 
 
 def _genre_similarity(profile: dict[str, float], genres: list[str]) -> tuple[float, list[str]]:
-    """Похожесть набора жанров на профиль (величина 0..1) и список совпавших жанров."""
+    """Похожесть набора жанров на профиль (0..1) и список совпавших жанров."""
     if not profile or not genres:
         return 0.0, []
     matched = [g for g in genres if g in profile]
@@ -71,99 +89,138 @@ def _genre_similarity(profile: dict[str, float], genres: list[str]) -> tuple[flo
     return min(sim, 1.0), matched
 
 
-def recommend(
-    watched: list[mc.WatchedAnime],
-    *,
-    top_titles: int = 15,
-    candidate_pool: int = 40,
-    final_count: int = 20,
-    alpha: float = 0.6,
-    session: requests.Session | None = None,
-    progress=None,
+def _recency_weight(year: int | None) -> float:
+    """Вес новизны: свежие тайтлы выше, старые не обнуляются (>= RECENCY_FLOOR)."""
+    if not year:
+        return RECENCY_FLOOR + (1 - RECENCY_FLOOR) * 0.3  # год неизвестен — умеренно
+    span = max(CURRENT_YEAR - RECENCY_BASE_YEAR, 1)
+    norm = (year - RECENCY_BASE_YEAR) / span
+    norm = min(max(norm, 0.0), 1.0)
+    return RECENCY_FLOOR + (1 - RECENCY_FLOOR) * norm
+
+
+def _quality_weight(score: float) -> float:
+    """Вес качества по оценке MAL: плохие тайтлы не всплывают только из-за новизны."""
+    if not score:
+        return QUALITY_FLOOR + (1 - QUALITY_FLOOR) * 0.4  # без оценки — умеренно
+    norm = (score - QUALITY_LOW) / max(QUALITY_HIGH - QUALITY_LOW, 0.1)
+    norm = min(max(norm, 0.0), 1.0)
+    return QUALITY_FLOOR + (1 - QUALITY_FLOOR) * norm
+
+
+def _score_candidates(
+    candidates: dict[int, dict], profile: dict[str, float]
 ) -> list[Recommendation]:
-    """Строит рекомендации.
+    """Считает баллы и возвращает кандидатов, отсортированных по убыванию.
 
-    Параметры:
-        watched: список просмотренных аниме пользователя.
-        top_titles: сколько любимых тайтлов опросить на рекомендации MAL.
-        candidate_pool: сколько лучших кандидатов догрузить жанрами для гибрида.
-        final_count: сколько рекомендаций вернуть.
-        alpha: вес сигнала MAL против сигнала жанров (0..1).
-        progress: необязательный колбэк progress(доля_0_1, текст).
+    Балл = совпадение_жанров * вес_новизны * вес_качества — баланс релевантности,
+    свежести и качества.
     """
-    sess = session or requests.Session()
-    watched_ids = {w.mal_id for w in watched}
-    title_by_id = {w.mal_id: w.title for w in watched}
-    profile = build_genre_profile(watched)
-
-    # --- Шаг 1: опрашиваем рекомендации MAL по любимым тайтлам ---------------
-    favourites = sorted(watched, key=lambda w: w.score, reverse=True)
-    favourites = [w for w in favourites if w.mal_id][:top_titles]
-
-    candidates: dict[int, mc.Candidate] = {}
-    for i, fav in enumerate(favourites):
-        if progress:
-            progress(0.1 + 0.5 * (i / max(len(favourites), 1)),
-                     f"Анализ рекомендаций для «{fav.title}»…")
-        try:
-            recs = mc.fetch_recommendations(fav.mal_id, sess)
-        except mc.MALError:
+    out: list[Recommendation] = []
+    for c in candidates.values():
+        sim, matched = _genre_similarity(profile, c["genres"])
+        if sim <= 0:
             continue
-        # Чем выше оценка исходного тайтла, тем больше доверия его рекомендациям.
-        weight = (fav.score / 10.0) if fav.score > 0 else 0.6
-        for r in recs:
-            cid = r["mal_id"]
-            if cid in watched_ids:
-                continue
-            cand = candidates.get(cid)
-            if cand is None:
-                cand = mc.Candidate(
-                    mal_id=cid, title=r["title"],
-                    image_url=r["image_url"], url=r["url"],
-                )
-                candidates[cid] = cand
-            cand.votes += r["votes"] * weight
-            cand.sources.add(fav.mal_id)
-
-    if not candidates:
-        return []
-
-    # --- Шаг 2: догружаем жанры для лучших кандидатов ------------------------
-    ranked = sorted(candidates.values(), key=lambda c: c.votes, reverse=True)
-    pool = ranked[:candidate_pool]
-    max_votes = max((c.votes for c in pool), default=1.0) or 1.0
-
-    for i, cand in enumerate(pool):
-        if progress:
-            progress(0.6 + 0.35 * (i / max(len(pool), 1)),
-                     f"Сверка жанров: «{cand.title}»…")
-        try:
-            cand.genres = mc.fetch_anime_genres(cand.mal_id, sess)
-        except mc.MALError:
-            cand.genres = []
-
-    # --- Шаг 3: гибридный скоринг -------------------------------------------
-    results: list[Recommendation] = []
-    for cand in pool:
-        rec_score = cand.votes / max_votes
-        genre_score, matched = _genre_similarity(profile, cand.genres)
-        final = alpha * rec_score + (1 - alpha) * genre_score
-        results.append(
+        recency = _recency_weight(c.get("year"))
+        quality = _quality_weight(c.get("score") or 0)
+        out.append(
             Recommendation(
-                mal_id=cand.mal_id,
-                title=cand.title,
-                image_url=cand.image_url,
-                url=cand.url,
-                score=final,
-                rec_score=rec_score,
-                genre_score=genre_score,
-                genres=cand.genres,
+                mal_id=c["mal_id"],
+                title=c["title"],
+                image_url=c["image_url"],
+                url=c["url"],
+                score=sim * recency * quality,
+                genre_score=sim,
+                recency=recency,
+                genres=c["genres"],
                 matched_genres=matched,
-                sources=[title_by_id[s] for s in cand.sources if s in title_by_id],
+                year=c.get("year"),
+                mal_score=float(c.get("score") or 0),
             )
         )
+    out.sort(key=lambda r: r.score, reverse=True)
+    return out
 
-    results.sort(key=lambda r: r.score, reverse=True)
-    if progress:
-        progress(1.0, "Готово!")
-    return results[:final_count]
+
+def recommend_iter(
+    watched: list[mc.WatchedAnime],
+    *,
+    genre_id_map: dict[str, int],
+    search_fn,
+    final_count: int = 20,
+    top_genres_count: int = 5,
+    extra_genres: list[str] | tuple[str, ...] = (),
+    exclude_genres: list[str] | tuple[str, ...] = (),
+):
+    """Генератор рекомендаций по жанрам с учётом новизны.
+
+    Параметры:
+        watched: список просмотренного (для профиля и исключения).
+        genre_id_map: соответствие «жанр → id» (из mal_client.fetch_genre_id_map).
+        search_fn: функция search_fn(genre_id, order_by, start_date) -> list[dict]
+            поиска кандидатов по жанру (можно обернуть в кэш на стороне приложения).
+        final_count: сколько рекомендаций отдавать.
+        top_genres_count: по скольким любимым жанрам искать.
+        extra_genres: жанры, которые искать дополнительно (даже если их мало в
+            просмотренном); они же добавляются в профиль с высоким весом.
+        exclude_genres: жанры/демография, тайтлы с которыми не предлагать.
+
+    Отдаёт кортежи (partial_results, доля_0_1, текст_прогресса). Последний
+    кортеж содержит финальный отсортированный список.
+    """
+    profile = build_genre_profile(watched)
+    exclude = set(exclude_genres)
+    watched_ids = {w.mal_id for w in watched}
+
+    # Добавленные жанры считаем сильным предпочтением, чтобы их совпадения весили.
+    for g in extra_genres:
+        profile[g] = max(profile.get(g, 0.0), 1.0)
+
+    if not profile or not genre_id_map:
+        yield [], 1.0, "Недостаточно данных: нет жанров в просмотренном."
+        return
+
+    # Сначала добавленные жанры, затем любимые из профиля; исключённые не ищем.
+    ranked = [g for g, _ in sorted(profile.items(), key=lambda kv: kv[1], reverse=True)]
+    ordered = list(dict.fromkeys(list(extra_genres) + ranked))
+    search_genres = [
+        g for g in ordered if g in genre_id_map and g not in exclude
+    ][:top_genres_count + len(extra_genres)]
+
+    if not search_genres:
+        yield [], 1.0, "Не удалось сопоставить жанры с каталогом."
+        return
+
+    # По каждому жанру — два запроса: популярное за всё время и популярное за
+    # последние годы (свежее). Так в пул попадают и классика, и новинки, а вес
+    # новизны/качества затем балансирует итог.
+    fresh_since = f"{CURRENT_YEAR - FRESH_YEARS}-01-01"
+    plan: list[tuple[str, int, str | None, str]] = []
+    for g in search_genres:
+        gid = genre_id_map[g]
+        plan.append((g, gid, None, "популярные"))
+        plan.append((g, gid, fresh_since, "свежие"))
+
+    candidates: dict[int, dict] = {}
+    total = len(plan)
+    partial: list[Recommendation] = []
+
+    for i, (gname, gid, start_date, label) in enumerate(plan):
+        text = f"Жанр «{gname}» — {label}…"
+        try:
+            results = search_fn(gid, "members", start_date)
+        except mc.MALError:
+            results = []
+        for c in results:
+            cid = c["mal_id"]
+            if cid in watched_ids or cid in candidates:
+                continue
+            if exclude and exclude.intersection(c["genres"]):
+                continue
+            candidates[cid] = c
+
+        partial = _score_candidates(candidates, profile)[:final_count]
+        yield partial, (i + 1) / total, text
+
+    if not plan:
+        yield [], 1.0, "Готово."
