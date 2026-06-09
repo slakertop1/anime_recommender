@@ -148,7 +148,76 @@ def fetch_anime_genres(mal_id: int, session: requests.Session | None = None) -> 
     sess = session or requests.Session()
     data = _jikan_get(f"/anime/{mal_id}", sess)
     node = data.get("data", {})
-    out = []
+    return _node_genre_names(node)
+
+
+def fetch_genre_id_map(session: requests.Session | None = None) -> dict[str, int]:
+    """Соответствие «название жанра → id» из Jikan (для поиска по жанрам)."""
+    sess = session or requests.Session()
+    data = _jikan_get("/genres/anime", sess)
+    out: dict[str, int] = {}
+    for g in data.get("data", []):
+        name, gid = g.get("name"), g.get("mal_id")
+        if name and gid:
+            out[name] = gid
+    return out
+
+
+def search_anime_by_genre(
+    genre_id: int,
+    session: requests.Session | None = None,
+    *,
+    order_by: str = "members",
+    sort: str = "desc",
+    min_score: float | None = 6.0,
+    start_date: str | None = None,
+    limit: int = 25,
+    page: int = 1,
+) -> list[dict]:
+    """Поиск аниме по жанру через Jikan.
+
+    Ответ уже содержит жанры и год, поэтому отдельный запрос деталей не нужен.
+    ``start_date`` (YYYY-MM-DD) ограничивает выдачу свежими тайтлами.
+    Возвращает список словарей: mal_id, title, image_url, url, genres, year,
+    score, members.
+    """
+    sess = session or requests.Session()
+    path = (
+        f"/anime?genres={genre_id}&order_by={order_by}&sort={sort}"
+        f"&limit={limit}&page={page}&sfw=true"
+    )
+    if min_score:
+        path += f"&min_score={min_score}"
+    if start_date:
+        path += f"&start_date={start_date}"
+    data = _jikan_get(path, sess)
+
+    out: list[dict] = []
+    for node in data.get("data", []):
+        if not node.get("mal_id"):
+            continue
+        year = node.get("year")
+        if not year:
+            aired_from = ((node.get("aired") or {}).get("from") or "")[:4]
+            year = int(aired_from) if aired_from.isdigit() else None
+        out.append(
+            {
+                "mal_id": node["mal_id"],
+                "title": node.get("title", "—"),
+                "image_url": node.get("images", {}).get("jpg", {}).get("image_url"),
+                "url": node.get("url"),
+                "genres": _node_genre_names(node),
+                "year": year,
+                "score": node.get("score") or 0,
+                "members": node.get("members") or 0,
+            }
+        )
+    return out
+
+
+def _node_genre_names(node: dict) -> list[str]:
+    """Названия жанров/тем/демографии из узла аниме Jikan."""
+    out: list[str] = []
     for key in ("genres", "themes", "demographics"):
         out.extend(g.get("name", "") for g in (node.get(key) or []) if g.get("name"))
     return out

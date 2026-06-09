@@ -72,6 +72,18 @@ def load_my_watched(access_token: str) -> list[mc.WatchedAnime]:
     return mc.fetch_my_completed_list(access_token)
 
 
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_genre_map() -> dict[str, int]:
+    """Соответствие «жанр → id» (меняется крайне редко — кэшируем на сутки)."""
+    return mc.fetch_genre_id_map()
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def cached_genre_search(genre_id: int, order_by: str, start_date: str | None) -> list[dict]:
+    """Кэшированный поиск кандидатов по жанру (переживает перезагрузку и повтор)."""
+    return mc.search_anime_by_genre(genre_id, order_by=order_by, start_date=start_date)
+
+
 def get_access_token() -> str | None:
     """Действующий access-токен авторизованного пользователя (с автообновлением)."""
     token = st.session_state.get("mal_token")
@@ -97,27 +109,25 @@ with st.sidebar:
             "Профиль на MyAnimeList должен быть публичным."
         ),
     )
-    alpha = st.slider(
-        "Баланс сигнала",
-        min_value=0.0, max_value=1.0, value=0.6, step=0.05,
-        help="0 — только совпадение жанров, 1 — только рекомендации MAL.",
-    )
     final_count = st.slider("Сколько рекомендаций показать", 5, 40, 20, 5)
-    use_all = st.checkbox(
-        "Учесть все просмотренные тайтлы",
-        help="Опрашивать рекомендации MAL по всему списку, а не только по топу.",
-    )
-    if use_all:
-        st.warning(
-            "⚠️ Это займёт время: на каждый просмотренный тайтл идёт отдельный "
-            "запрос к API (~0.5 c из-за лимитов). Сотни тайтлов — это несколько "
-            "минут ожидания."
+    st.caption("Рекомендации строятся по вашим любимым жанрам с поправкой на новизну.")
+
+    try:
+        _genre_options = sorted(g for g in load_genre_map() if g not in {"Hentai", "Erotica"})
+    except mc.MALError:
+        _genre_options = []
+    if _genre_options:
+        exclude_genres = st.multiselect(
+            "Исключить жанры/демографию", _genre_options,
+            help="Тайтлы с этими тегами не предлагать (например, Shounen, Ecchi).",
         )
-    top_titles = st.slider(
-        "Сколько любимых тайтлов учитывать", 5, 30, 15, 1,
-        help="Больше — точнее, но дольше из-за лимитов API.",
-        disabled=use_all,
-    )
+        extra_genres = st.multiselect(
+            "Добавить жанры в поиск", _genre_options,
+            help="Искать ещё и по этим жанрам, даже если их мало в просмотренном.",
+        )
+    else:
+        exclude_genres, extra_genres = [], []
+
     go = st.button("Подобрать рекомендации", type="primary", use_container_width=True)
 
     st.divider()
@@ -181,8 +191,23 @@ def _mark_watched(r: rec.Recommendation) -> None:
     st.toast(f"«{r.title}» отмечено просмотренным на MAL{note}.", icon="✅")
 
 
-def render_recommendations(recs: list[rec.Recommendation]) -> None:
-    logged_in = "mal_token" in st.session_state
+def explain(r: rec.Recommendation) -> str:
+    """Короткое пояснение «почему показано» из данных ранжирования (без API)."""
+    parts: list[str] = []
+    if r.matched_genres:
+        parts.append("🏷️ совпало по жанрам: " + ", ".join(r.matched_genres[:4]))
+    if r.year and r.year >= rec.CURRENT_YEAR - rec.FRESH_YEARS:
+        parts.append(f"🆕 свежее ({r.year})")
+    elif r.year:
+        parts.append(f"📅 {r.year}")
+    if r.mal_score >= 7.5:
+        parts.append(f"⭐ высокая оценка ({r.mal_score:.1f})")
+    return " · ".join(parts) if parts else "по вашим жанрам"
+
+
+def render_recommendations(recs: list[rec.Recommendation], *, interactive: bool = True) -> None:
+    """Рисует карточки. interactive=False — лёгкое превью без кнопок (во время анализа)."""
+    can_mark = interactive and "mal_token" in st.session_state
     cols_per_row = 4
     for row_start in range(0, len(recs), cols_per_row):
         row = recs[row_start:row_start + cols_per_row]
@@ -191,16 +216,14 @@ def render_recommendations(recs: list[rec.Recommendation]) -> None:
             with col:
                 if r.image_url:
                     st.image(r.image_url, use_container_width=True)
-                st.markdown(f"**[{r.title}]({r.url})**" if r.url else f"**{r.title}**")
+                year = f" · {r.year}" if r.year else ""
+                title = f"**[{r.title}]({r.url})**" if r.url else f"**{r.title}**"
+                st.markdown(title + f"<br><span style='color:gray;font-size:0.8em'>{year}</span>"
+                            if year else title, unsafe_allow_html=True)
                 st.progress(min(r.score, 1.0), text=f"Совпадение: {r.score * 100:.0f}%")
-                if r.matched_genres:
-                    st.caption("🏷️ " + ", ".join(r.matched_genres))
-                if r.sources:
-                    shown = ", ".join(r.sources[:3])
-                    extra = f" и ещё {len(r.sources) - 3}" if len(r.sources) > 3 else ""
-                    st.caption(f"↪ похоже на: {shown}{extra}")
+                st.caption(explain(r))
 
-                if logged_in:
+                if can_mark:
                     sc, btn = st.columns([1, 1])
                     sc.selectbox(
                         "Оценка", SCORE_OPTIONS, key=f"score_{r.mal_id}",
@@ -219,16 +242,14 @@ if go:
         st.warning("Введите ник на MyAnimeList или войдите слева.")
         st.stop()
 
-    session = requests.Session()
+    # Новый анализ — сбрасываем прошлый результат.
+    st.session_state.pop("recs", None)
 
     # 1. Грузим список просмотренного: свой — через API, чужой — по нику.
     spinner_text = f"Загружаю список «{uname}»…" if uname else "Загружаю ваш список…"
     with st.spinner(spinner_text):
         try:
-            if uname:
-                watched = load_watched(uname)
-            else:
-                watched = load_my_watched(get_access_token())
+            watched = load_watched(uname) if uname else load_my_watched(get_access_token())
         except mc.MALError as exc:
             st.error(str(exc))
             st.stop()
@@ -237,36 +258,39 @@ if go:
         st.warning("В списке просмотренного (completed) пусто — рекомендовать нечего.")
         st.stop()
 
-    # Краткая сводка вкусов.
     profile = rec.build_genre_profile(watched)
-    top_genres = []
-    if profile:
-        top_genres = [g for g, _ in sorted(profile.items(), key=lambda kv: kv[1], reverse=True)[:8]]
+    top_genres = [g for g, _ in sorted(profile.items(), key=lambda kv: kv[1], reverse=True)[:8]]
 
-    # 2. Считаем рекомендации с прогресс-баром.
+    genre_map = load_genre_map()
+
+    # 2. Прогрессивный подбор: тайтлы появляются по мере опроса жанров.
     progress_bar = st.progress(0.0, text="Готовлюсь…")
-
-    def on_progress(frac: float, text: str) -> None:
-        progress_bar.progress(min(frac, 1.0), text=text)
-
-    effective_top = len(watched) if use_all else top_titles
+    preview = st.empty()
+    final: list[rec.Recommendation] = []
     try:
-        recs = rec.recommend(
+        for partial, frac, text in rec.recommend_iter(
             watched,
-            top_titles=effective_top,
+            genre_id_map=genre_map,
+            search_fn=cached_genre_search,
             final_count=final_count,
-            alpha=alpha,
-            session=session,
-            progress=on_progress,
-        )
+            extra_genres=extra_genres,
+            exclude_genres=exclude_genres,
+        ):
+            final = partial
+            progress_bar.progress(min(frac, 1.0), text=text)
+            with preview.container():
+                if partial:
+                    st.caption("Подбираю рекомендации…")
+                    render_recommendations(partial, interactive=False)
     except mc.MALError as exc:
         st.error(str(exc))
         st.stop()
     finally:
         progress_bar.empty()
+        preview.empty()
 
-    # Сохраняем результат в сессии, чтобы он переживал перерисовки при отметках.
-    st.session_state["recs"] = recs
+    # Сохраняем результат в сессии: держится до следующего запуска анализа.
+    st.session_state["recs"] = final
     st.session_state["watched_count"] = len(watched)
     st.session_state["top_genres"] = top_genres
 
@@ -283,8 +307,8 @@ if recs:
     render_recommendations(recs)
 elif recs == []:
     st.warning(
-        "Не удалось собрать рекомендации — у выбранных тайтлов их нет на MAL. "
-        "Попробуйте увеличить число учитываемых тайтлов."
+        "Не удалось собрать рекомендации по жанрам. Возможно, в списке слишком "
+        "мало тайтлов с жанрами — попробуйте другой профиль или повторите позже."
     )
 else:
     st.info("👈 Введите ник в панели слева и нажмите «Подобрать рекомендации».")
