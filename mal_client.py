@@ -171,6 +171,7 @@ def search_anime_by_genre(
     sort: str = "desc",
     min_score: float | None = 6.0,
     start_date: str | None = None,
+    sfw: bool = True,
     limit: int = 25,
     page: int = 1,
 ) -> list[dict]:
@@ -178,14 +179,17 @@ def search_anime_by_genre(
 
     Ответ уже содержит жанры и год, поэтому отдельный запрос деталей не нужен.
     ``start_date`` (YYYY-MM-DD) ограничивает выдачу свежими тайтлами.
+    ``sfw=False`` снимает фильтр взрослого контента (для режима 18+).
     Возвращает список словарей: mal_id, title, image_url, url, genres, year,
     score, members.
     """
     sess = session or requests.Session()
     path = (
         f"/anime?genres={genre_id}&order_by={order_by}&sort={sort}"
-        f"&limit={limit}&page={page}&sfw=true"
+        f"&limit={limit}&page={page}"
     )
+    if sfw:
+        path += "&sfw=true"
     if min_score:
         path += f"&min_score={min_score}"
     if start_date:

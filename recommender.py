@@ -151,6 +151,7 @@ def recommend_iter(
     top_genres_count: int = 5,
     extra_genres: list[str] | tuple[str, ...] = (),
     exclude_genres: list[str] | tuple[str, ...] = (),
+    sfw: bool = True,
 ):
     """Генератор рекомендаций по жанрам с учётом новизны.
 
@@ -208,7 +209,7 @@ def recommend_iter(
     for i, (gname, gid, start_date, label) in enumerate(plan):
         text = f"Жанр «{gname}» — {label}…"
         try:
-            results = search_fn(gid, "members", start_date)
+            results = search_fn(gid, "members", start_date, sfw)
         except mc.MALError:
             results = []
         for c in results:
