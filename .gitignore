@@ -7,3 +7,4 @@ __pycache__/
 .env
 .mal_token.json
 .mal_oauth_pending.json
+.streamlit/secrets.toml

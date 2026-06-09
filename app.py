@@ -14,16 +14,30 @@ import recommender as rec
 
 st.set_page_config(page_title="Рекомендатель аниме", page_icon="🎬", layout="wide")
 
-cfg = mc.load_config()
+def read_config() -> dict:
+    """Конфиг MAL: сначала Streamlit Secrets (для хостинга), затем .env/окружение."""
+    cfg = mc.load_config()
+    try:
+        secret_map = {
+            "MAL_CLIENT_ID": "client_id",
+            "MAL_CLIENT_SECRET": "client_secret",
+            "MAL_REDIRECT_URI": "redirect_uri",
+        }
+        for secret_key, cfg_key in secret_map.items():
+            if secret_key in st.secrets:
+                cfg[cfg_key] = st.secrets[secret_key]
+    except Exception:
+        # Файла секретов нет (обычный локальный запуск) — это нормально.
+        pass
+    return cfg
 
-# Подтягиваем сохранённый токен, чтобы вход переживал перезапуск приложения.
-if "mal_token" not in st.session_state:
-    saved = mc.load_saved_token()
-    if saved:
-        st.session_state["mal_token"] = saved
+
+cfg = read_config()
 
 
 # --- Обработка возврата с авторизации MAL (?code=...&state=...) --------------
+# Токен живёт только в session_state текущего посетителя и на диск не пишется,
+# поэтому на общем хостинге пользователи не делят один вход.
 _qp = st.query_params
 if "code" in _qp and "mal_token" not in st.session_state:
     if not cfg["client_id"]:
@@ -31,7 +45,8 @@ if "code" in _qp and "mal_token" not in st.session_state:
         st.stop()
     try:
         token = mc.exchange_code_for_token(
-            cfg["client_id"], cfg["client_secret"], _qp["code"], _qp.get("state")
+            cfg["client_id"], cfg["client_secret"], _qp["code"],
+            cfg["redirect_uri"], _qp.get("state"),
         )
         st.session_state["mal_token"] = token
     except mc.MALError as exc:
@@ -122,7 +137,6 @@ with st.sidebar:
             st.session_state["mal_username"] = name or ""
         st.success(f"Вы вошли как **{name}**" if name else "Вы вошли в MyAnimeList")
         if st.button("Выйти", use_container_width=True):
-            mc.clear_token()
             for key in ("mal_token", "mal_username"):
                 st.session_state.pop(key, None)
             st.rerun()
@@ -130,7 +144,7 @@ with st.sidebar:
         st.caption("Войдите, чтобы отмечать аниме просмотренными прямо в своём списке.")
         st.link_button(
             "🔑 Войти через MyAnimeList",
-            mc.build_auth_url(cfg["client_id"]),
+            mc.build_auth_url(cfg["client_id"], cfg["redirect_uri"]),
             use_container_width=True,
         )
 
