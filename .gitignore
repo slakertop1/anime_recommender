@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .idea/
 .env
+.mal_token.json
+.mal_oauth_pending.json
