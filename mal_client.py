@@ -204,7 +204,10 @@ def search_anime_by_genre(
             {
                 "mal_id": node["mal_id"],
                 "title": node.get("title", "—"),
-                "image_url": node.get("images", {}).get("jpg", {}).get("image_url"),
+                "image_url": (
+                    node.get("images", {}).get("jpg", {}).get("large_image_url")
+                    or node.get("images", {}).get("jpg", {}).get("image_url")
+                ),
                 "url": node.get("url"),
                 "genres": _node_genre_names(node),
                 "year": year,

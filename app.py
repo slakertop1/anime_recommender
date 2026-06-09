@@ -208,7 +208,7 @@ def explain(r: rec.Recommendation) -> str:
 def render_recommendations(recs: list[rec.Recommendation], *, interactive: bool = True) -> None:
     """Рисует карточки. interactive=False — лёгкое превью без кнопок (во время анализа)."""
     can_mark = interactive and "mal_token" in st.session_state
-    cols_per_row = 4
+    cols_per_row = 6
     for row_start in range(0, len(recs), cols_per_row):
         row = recs[row_start:row_start + cols_per_row]
         cols = st.columns(cols_per_row)
