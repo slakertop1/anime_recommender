@@ -79,9 +79,9 @@ def load_genre_map() -> dict[str, int]:
 
 
 @st.cache_data(show_spinner=False, ttl=86400)
-def cached_genre_search(genre_id: int, order_by: str, start_date: str | None) -> list[dict]:
+def cached_genre_search(genre_id: int, order_by: str, start_date: str | None, sfw: bool) -> list[dict]:
     """Кэшированный поиск кандидатов по жанру (переживает перезагрузку и повтор)."""
-    return mc.search_anime_by_genre(genre_id, order_by=order_by, start_date=start_date)
+    return mc.search_anime_by_genre(genre_id, order_by=order_by, start_date=start_date, sfw=sfw)
 
 
 def get_access_token() -> str | None:
@@ -112,8 +112,15 @@ with st.sidebar:
     final_count = st.slider("Сколько рекомендаций показать", 5, 40, 20, 5)
     st.caption("Рекомендации строятся по вашим любимым жанрам с поправкой на новизну.")
 
+    show_nsfw = st.checkbox(
+        "Показывать 18+ (NSFW)",
+        help="Включает взрослый контент и жанры вроде Hentai в подборе и фильтрах.",
+    )
+    _nsfw_genres = {"Hentai", "Erotica"}
     try:
-        _genre_options = sorted(g for g in load_genre_map() if g not in {"Hentai", "Erotica"})
+        _genre_options = sorted(
+            g for g in load_genre_map() if show_nsfw or g not in _nsfw_genres
+        )
     except mc.MALError:
         _genre_options = []
     if _genre_options:
@@ -275,6 +282,7 @@ if go:
             final_count=final_count,
             extra_genres=extra_genres,
             exclude_genres=exclude_genres,
+            sfw=not show_nsfw,
         ):
             final = partial
             progress_bar.progress(min(frac, 1.0), text=text)
