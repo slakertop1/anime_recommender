@@ -143,11 +143,12 @@ with st.sidebar:
     else:
         st.caption("Войдите, чтобы отмечать аниме просмотренными прямо в своём списке.")
         auth_url = mc.build_auth_url(cfg["client_id"], cfg["redirect_uri"])
-        # target="_self" — переход на MAL в этой же вкладке, а не в попапе.
-        # Иначе после авторизации токен оседает в сессии попапа, а основная
-        # вкладка остаётся незалогиненной (на хостинге это ломало вход).
+        # target="_top" — переход на MAL в самом верхнем окне. На Streamlit Cloud
+        # приложение работает внутри iframe; "_self" открыл бы MAL прямо в нём,
+        # а MAL запрещает встраивание (X-Frame-Options) → ошибка/попап. "_top"
+        # выводит на полноэкранный переход, и токен возвращается в ту же сессию.
         st.markdown(
-            f'<a href="{auth_url}" target="_self" style="display:inline-block;'
+            f'<a href="{auth_url}" target="_top" style="display:inline-block;'
             f'box-sizing:border-box;width:100%;text-align:center;padding:0.5rem 1rem;'
             f'background-color:#ff4b4b;color:#ffffff;border-radius:0.5rem;'
             f'font-weight:600;text-decoration:none;">🔑 Войти через MyAnimeList</a>',
