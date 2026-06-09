@@ -143,15 +143,17 @@ with st.sidebar:
     else:
         st.caption("Войдите, чтобы отмечать аниме просмотренными прямо в своём списке.")
         auth_url = mc.build_auth_url(cfg["client_id"], cfg["redirect_uri"])
-        # target="_top" — переход на MAL в самом верхнем окне. На Streamlit Cloud
-        # приложение работает внутри iframe; "_self" открыл бы MAL прямо в нём,
-        # а MAL запрещает встраивание (X-Frame-Options) → ошибка/попап. "_top"
-        # выводит на полноэкранный переход, и токен возвращается в ту же сессию.
+        # target="_blank" — открываем MAL в НОВОЙ вкладке. На Streamlit Cloud
+        # приложение работает в iframe с песочницей, которая блокирует переход
+        # в верхнем окне (target="_top"/"_self" → клик «молчит»). Новая вкладка
+        # не ограничена песочницей: пользователь авторизуется там, MAL вернёт
+        # его на адрес приложения с ?code=, и вход завершится в этой же вкладке.
         st.markdown(
-            f'<a href="{auth_url}" target="_top" style="display:inline-block;'
-            f'box-sizing:border-box;width:100%;text-align:center;padding:0.5rem 1rem;'
-            f'background-color:#ff4b4b;color:#ffffff;border-radius:0.5rem;'
-            f'font-weight:600;text-decoration:none;">🔑 Войти через MyAnimeList</a>',
+            f'<a href="{auth_url}" target="_blank" rel="noopener" '
+            f'style="display:inline-block;box-sizing:border-box;width:100%;'
+            f'text-align:center;padding:0.5rem 1rem;background-color:#ff4b4b;'
+            f'color:#ffffff;border-radius:0.5rem;font-weight:600;'
+            f'text-decoration:none;">🔑 Войти через MyAnimeList (новая вкладка)</a>',
             unsafe_allow_html=True,
         )
 
