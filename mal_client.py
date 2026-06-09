@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import secrets
 import time
@@ -206,9 +205,10 @@ OAUTH_AUTHORIZE_URL = "https://myanimelist.net/v1/oauth2/authorize"
 OAUTH_TOKEN_URL = "https://myanimelist.net/v1/oauth2/token"
 API_V2_BASE = "https://api.myanimelist.net/v2"
 
-# Должен дословно совпадать с App Redirect URL, указанным при регистрации
-# приложения на https://myanimelist.net/apps.
-REDIRECT_URI = "http://localhost:8501/"
+# Запасной Redirect URL для локального запуска. На хостинге его задают через
+# MAL_REDIRECT_URI (см. load_config) и дублируют в настройках приложения MAL —
+# значение должно дословно совпадать с одним из App Redirect URL.
+DEFAULT_REDIRECT_URI = "http://localhost:8501/"
 
 # Статусы записи в официальном API (поле my_list_status.status).
 LIST_STATUS_WATCHING = "watching"
@@ -219,8 +219,12 @@ LIST_STATUS_PLAN = "plan_to_watch"
 
 _PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_FILE = os.path.join(_PROJECT_DIR, ".env")
-_TOKEN_FILE = os.path.join(_PROJECT_DIR, ".mal_token.json")
-_PENDING_FILE = os.path.join(_PROJECT_DIR, ".mal_oauth_pending.json")
+
+# PKCE-verifier'ы, ожидающие возврата с авторизации; ключ — параметр state.
+# Держим в памяти процесса, а не в файле: при нескольких пользователях
+# параллельные входы не должны затирать друг друга. При перезапуске сервера
+# словарь обнуляется — это влияет только на вход, идущий прямо сейчас.
+_pending_verifiers: dict[str, str] = {}
 
 
 class MALAuthError(MALError):
@@ -228,7 +232,12 @@ class MALAuthError(MALError):
 
 
 def load_config() -> dict:
-    """Возвращает {'client_id', 'client_secret'} из .env или переменных окружения."""
+    """Конфиг MAL из .env или переменных окружения.
+
+    Возвращает client_id, client_secret и redirect_uri (последний — из
+    MAL_REDIRECT_URI, иначе локальный по умолчанию). На Streamlit Cloud эти же
+    ключи берутся из st.secrets — см. app.py.
+    """
     file_cfg: dict[str, str] = {}
     if os.path.exists(_ENV_FILE):
         with open(_ENV_FILE, encoding="utf-8") as f:
@@ -241,6 +250,11 @@ def load_config() -> dict:
     return {
         "client_id": os.environ.get("MAL_CLIENT_ID") or file_cfg.get("MAL_CLIENT_ID", ""),
         "client_secret": os.environ.get("MAL_CLIENT_SECRET") or file_cfg.get("MAL_CLIENT_SECRET", ""),
+        "redirect_uri": (
+            os.environ.get("MAL_REDIRECT_URI")
+            or file_cfg.get("MAL_REDIRECT_URI", "")
+            or DEFAULT_REDIRECT_URI
+        ),
     }
 
 
@@ -249,57 +263,52 @@ def _new_code_verifier() -> str:
     return secrets.token_urlsafe(96)[:128]
 
 
-def build_auth_url(client_id: str) -> str:
+def build_auth_url(client_id: str, redirect_uri: str = DEFAULT_REDIRECT_URI) -> str:
     """Готовит ссылку на страницу авторизации MAL.
 
-    PKCE-verifier и state сохраняются в файл, потому что после редиректа обратно
-    Streamlit поднимает новую сессию и значения из session_state теряются.
+    PKCE-verifier кладётся в память процесса под ключом state, потому что после
+    редиректа обратно Streamlit поднимает новую сессию и session_state теряется.
     """
     verifier = _new_code_verifier()
     state = secrets.token_urlsafe(16)
-    with open(_PENDING_FILE, "w", encoding="utf-8") as f:
-        json.dump({"verifier": verifier, "state": state}, f)
+    _pending_verifiers[state] = verifier
     params = {
         "response_type": "code",
         "client_id": client_id,
         "code_challenge": verifier,        # метод plain → challenge = verifier
         "code_challenge_method": "plain",
         "state": state,
-        "redirect_uri": REDIRECT_URI,
+        "redirect_uri": redirect_uri,
     }
     return OAUTH_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
 
 
 def exchange_code_for_token(
-    client_id: str, client_secret: str, code: str, state: str | None = None
+    client_id: str,
+    client_secret: str,
+    code: str,
+    redirect_uri: str = DEFAULT_REDIRECT_URI,
+    state: str | None = None,
 ) -> dict:
-    """Меняет authorization code на access/refresh-токены и сохраняет их."""
-    try:
-        with open(_PENDING_FILE, encoding="utf-8") as f:
-            pending = json.load(f)
-    except (OSError, ValueError) as exc:
-        raise MALAuthError("Сессия авторизации потеряна — войдите заново.") from exc
+    """Меняет authorization code на access/refresh-токены.
 
-    if state and pending.get("state") and state != pending["state"]:
-        raise MALAuthError("Несовпадение state при авторизации (возможна подмена).")
+    Токен НЕ сохраняется на диск — его хранит вызывающая сторона в своей сессии,
+    чтобы на общем сервере пользователи не делили один вход.
+    """
+    verifier = _pending_verifiers.pop(state, None) if state else None
+    if not verifier:
+        raise MALAuthError("Сессия авторизации потеряна — войдите заново.")
 
     data = {
         "client_id": client_id,
         "grant_type": "authorization_code",
         "code": code,
-        "code_verifier": pending["verifier"],
-        "redirect_uri": REDIRECT_URI,
+        "code_verifier": verifier,
+        "redirect_uri": redirect_uri,
     }
     if client_secret:
         data["client_secret"] = client_secret
-
-    token = _post_token(data)
-    _save_token(token)
-    try:
-        os.remove(_PENDING_FILE)
-    except OSError:
-        pass
-    return token
+    return _post_token(data)
 
 
 def refresh_access_token(client_id: str, client_secret: str, refresh_token: str) -> dict:
@@ -311,9 +320,7 @@ def refresh_access_token(client_id: str, client_secret: str, refresh_token: str)
     }
     if client_secret:
         data["client_secret"] = client_secret
-    token = _post_token(data)
-    _save_token(token)
-    return token
+    return _post_token(data)
 
 
 def valid_access_token(token: dict, client_id: str, client_secret: str) -> tuple[str, dict]:
@@ -473,27 +480,3 @@ def _post_token(data: dict) -> dict:
     token["obtained_at"] = time.time()
     token["expires_at"] = time.time() + token.get("expires_in", 3600)
     return token
-
-
-def _save_token(token: dict) -> None:
-    with open(_TOKEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(token, f)
-
-
-def load_saved_token() -> dict | None:
-    """Возвращает сохранённый токен (чтобы вход переживал перезапуск), либо None."""
-    if not os.path.exists(_TOKEN_FILE):
-        return None
-    try:
-        with open(_TOKEN_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return None
-
-
-def clear_token() -> None:
-    for path in (_TOKEN_FILE, _PENDING_FILE):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
