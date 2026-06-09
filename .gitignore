@@ -1,0 +1,7 @@
+newvenv/
+venv313/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+.env
